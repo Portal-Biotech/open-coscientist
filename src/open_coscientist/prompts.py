@@ -156,6 +156,47 @@ def substitute_variables(template: str, variables: Dict[str, Any]) -> str:
     return re.sub(r"\{\{([^}]+)\}\}", replacer, template)
 
 
+# domain variable injection from YAML config
+
+
+def _get_domain_variables(tool_registry: Optional[Any] = None) -> Dict[str, str]:
+    """
+    Get domain-specific prompt variables from tool registry config.
+
+    Returns dict with domain_context, domain_generation_guidance,
+    domain_review_guidance, domain_evolution_guidance.
+    All default to empty string if no config is available.
+    """
+    empty = {
+        "domain_context": "",
+        "domain_generation_guidance": "",
+        "domain_review_guidance": "",
+        "domain_evolution_guidance": "",
+    }
+
+    if tool_registry is None:
+        try:
+            from .config import get_tool_registry
+            tool_registry = get_tool_registry()
+        except Exception:
+            return empty
+
+    if tool_registry is None:
+        return empty
+
+    try:
+        prompts_config = tool_registry.get_prompts_config()
+    except Exception:
+        return empty
+
+    return {
+        "domain_context": prompts_config.domain_context,
+        "domain_generation_guidance": prompts_config.generation_guidance,
+        "domain_review_guidance": prompts_config.review_guidance,
+        "domain_evolution_guidance": prompts_config.evolution_guidance,
+    }
+
+
 # Convenience functions for common prompts
 def get_generation_prompt(
     research_goal: str,
@@ -265,6 +306,7 @@ def get_review_prompt(
     hypothesis_text: str,
     supervisor_guidance: Dict[str, Any] | None = None,
     meta_review: Dict[str, Any] | None = None,
+    tool_registry: Optional[Any] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Get the hypothesis review prompt and schema."""
     variables = {"research_goal": research_goal, "hypothesis_text": hypothesis_text}
@@ -275,6 +317,9 @@ def get_review_prompt(
     # Add meta-review context if available (for re-reviewing evolved hypotheses)
     variables["meta_review_context"] = _format_meta_review_context(meta_review)
 
+    # inject domain-specific prompt customizations
+    variables.update(_get_domain_variables(tool_registry))
+
     return load_prompt_with_schema("review", variables)
 
 
@@ -283,6 +328,7 @@ def get_review_batch_prompt(
     hypotheses_list: str,
     supervisor_guidance: Dict[str, Any] | None = None,
     meta_review: Dict[str, Any] | None = None,
+    tool_registry: Optional[Any] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Get the comparative batch hypothesis review prompt and schema."""
     variables = {"research_goal": research_goal, "hypotheses_list": hypotheses_list}
@@ -292,6 +338,9 @@ def get_review_batch_prompt(
 
     # Add meta-review context if available (for re-reviewing evolved hypotheses)
     variables["meta_review_context"] = _format_meta_review_context(meta_review)
+
+    # inject domain-specific prompt customizations
+    variables.update(_get_domain_variables(tool_registry))
 
     return load_prompt_with_schema("review_batch", variables)
 
@@ -319,6 +368,7 @@ def get_ranking_prompt(
     review_b: Dict[str, Any] | None = None,
     reflection_notes_a: str | None = None,
     reflection_notes_b: str | None = None,
+    tool_registry: Optional[Any] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Get the ranking (and tournament) comparison prompt and schema."""
     variables = {
@@ -341,6 +391,9 @@ def get_ranking_prompt(
         reflection_notes_b or "No reflection notes available."
     )
 
+    # inject domain-specific prompt customizations
+    variables.update(_get_domain_variables(tool_registry))
+
     return load_prompt_with_schema("ranking", variables)
 
 
@@ -349,6 +402,7 @@ def get_meta_review_prompt(
     all_reviews: str,
     supervisor_guidance: Dict[str, Any] | None = None,
     instructions: str | None = None,
+    tool_registry: Optional[Any] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Get the meta-review synthesis prompt and schema."""
     variables = {"research_goal": research_goal, "all_reviews": all_reviews}
@@ -357,6 +411,9 @@ def get_meta_review_prompt(
     variables["supervisor_guidance"] = _format_supervisor_guidance_for_meta_review(
         supervisor_guidance
     )
+
+    # inject domain-specific prompt customizations
+    variables.update(_get_domain_variables(tool_registry))
 
     return load_prompt_with_schema("meta_review", variables)
 
@@ -393,6 +450,7 @@ def get_supervisor_prompt(
     evolution_max_count: int | None = None,
     mcp_available: bool = False,
     pubmed_available: bool = False,
+    tool_registry: Optional[Any] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """get the supervisor research planning prompt and schema."""
 
@@ -405,29 +463,31 @@ def get_supervisor_prompt(
     else:
         lit_review_description = "literature review is not available (no pubmed access)"
 
-    return load_prompt_with_schema(
-        "supervisor",
-        {
-            "research_goal": research_goal,
-            "preferences": preferences or "None provided",
-            "attributes": ", ".join(attributes) if attributes else "None provided",
-            "constraints": (
-                "\n".join(f"- {c}" for c in constraints) if constraints else "None provided"
-            ),
-            "user_hypotheses": (
-                "\n".join(f"- {h}" for h in user_hypotheses) if user_hypotheses else "None provided"
-            ),
-            "user_literature": (
-                "\n".join(f"- {lit}" for lit in user_literature)
-                if user_literature
-                else "None provided"
-            ),
-            "initial_hypotheses_count": initial_hypotheses_count or "not specified",
-            "max_iterations": max_iterations or "not specified",
-            "evolution_max_count": evolution_max_count or "not specified",
-            "literature_review_description": lit_review_description,
-        },
-    )
+    variables = {
+        "research_goal": research_goal,
+        "preferences": preferences or "None provided",
+        "attributes": ", ".join(attributes) if attributes else "None provided",
+        "constraints": (
+            "\n".join(f"- {c}" for c in constraints) if constraints else "None provided"
+        ),
+        "user_hypotheses": (
+            "\n".join(f"- {h}" for h in user_hypotheses) if user_hypotheses else "None provided"
+        ),
+        "user_literature": (
+            "\n".join(f"- {lit}" for lit in user_literature)
+            if user_literature
+            else "None provided"
+        ),
+        "initial_hypotheses_count": initial_hypotheses_count or "not specified",
+        "max_iterations": max_iterations or "not specified",
+        "evolution_max_count": evolution_max_count or "not specified",
+        "literature_review_description": lit_review_description,
+    }
+
+    # inject domain-specific prompt customizations
+    variables.update(_get_domain_variables(tool_registry))
+
+    return load_prompt_with_schema("supervisor", variables)
 
 
 # Helper functions to format supervisor guidance for different contexts
@@ -610,74 +670,21 @@ def _format_supervisor_guidance_for_meta_review(supervisor_guidance: Dict[str, A
     return "".join(sections) if sections else ""
 
 
-def _format_evolution_details_context(evolution_details: List[Dict[str, Any]] | None) -> str:
-    """Format evolution details for meta-review prompts."""
-    if (
-        not evolution_details
-        or not isinstance(evolution_details, list)
-        or len(evolution_details) == 0
-    ):
-        return ""
-
-    sections = []
-    sections.append("## Previous Evolution History\n")
-    sections.append(
-        "The following hypotheses were evolved in previous iterations. Consider what changes were made and their effectiveness:\n\n"
-    )
-
-    # Show last 5 evolution details to avoid overwhelming the prompt
-    recent_evolutions = evolution_details[-5:]
-    for i, evo_detail in enumerate(recent_evolutions, 1):
-        if isinstance(evo_detail, dict):
-            original = evo_detail.get("original", "")[:150]
-            evolved = evo_detail.get("evolved", "")[:150]
-            rationale = evo_detail.get("rationale", "")[:100]
-
-            sections.append(f"**Evolution {i}:**\n")
-            sections.append(f"- Original: {original}...\n")
-            sections.append(f"- Evolved: {evolved}...\n")
-            if rationale:
-                sections.append(f"- Rationale: {rationale}...\n")
-            sections.append("\n")
-
-    sections.append(
-        "Use this history to inform your recommendations and avoid repeating ineffective changes.\n"
-    )
-
-    return "".join(sections) if sections else ""
-
-
-def _format_supervisor_guidance_for_evolution(supervisor_guidance: Dict[str, Any] | None) -> str:
-    """Format supervisor guidance for evolution prompts."""
-    if not supervisor_guidance or not isinstance(supervisor_guidance, dict):
-        return ""
-
-    sections = []
-    workflow_plan = supervisor_guidance.get("workflow_plan", {})
-    evolution_phase = workflow_plan.get("evolution_phase", {})
-
-    if evolution_phase:
-        sections.append("## Supervisor Guidance for Evolution\n")
-        if evolution_phase.get("refinement_priorities"):
-            priorities = evolution_phase["refinement_priorities"]
-            if isinstance(priorities, list):
-                priorities = ", ".join(priorities)
-            sections.append(f"**Refinement Priorities:** {priorities}\n")
-        if evolution_phase.get("iteration_strategy"):
-            sections.append(f"**Iteration Strategy:** {evolution_phase['iteration_strategy']}\n")
-        sections.append("\nUse this guidance to align your refinement with the research plan.\n")
-
-    return "".join(sections) if sections else ""
-
-
 def get_reflection_prompt(
-    articles_with_reasoning: str, hypothesis_text: str
+    articles_with_reasoning: str,
+    hypothesis_text: str,
+    tool_registry: Optional[Any] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Get the reflection observations prompt and schema."""
-    return load_prompt_with_schema(
-        "reflection_observations",
-        {"articles_with_reasoning": articles_with_reasoning, "hypothesis": hypothesis_text},
-    )
+    variables = {
+        "articles_with_reasoning": articles_with_reasoning,
+        "hypothesis": hypothesis_text,
+    }
+
+    # inject domain-specific prompt customizations
+    variables.update(_get_domain_variables(tool_registry))
+
+    return load_prompt_with_schema("reflection_observations", variables)
 
 
 def get_literature_review_query_generation_pubmed_prompt(
@@ -690,6 +697,62 @@ def get_literature_review_query_generation_pubmed_prompt(
     """Get the PubMed query generation prompt."""
     return load_prompt(
         "literature_review_query_generation_pubmed",
+        {
+            "research_goal": research_goal,
+            "preferences": preferences if preferences else "None provided",
+            "attributes": ", ".join(attributes) if attributes else "None provided",
+            "user_literature": (
+                "\n".join(f"- {lit}" for lit in user_literature)
+                if user_literature
+                else "None provided"
+            ),
+            "user_hypotheses": (
+                "\n".join(f"- {hyp}" for hyp in user_hypotheses)
+                if user_hypotheses
+                else "None provided"
+            ),
+        },
+    )
+
+
+def get_literature_review_query_generation_prompt(
+    research_goal: str,
+    source_type: str = "academic",
+    preferences: str | None = None,
+    attributes: list[str] | None = None,
+    user_literature: list[str] | None = None,
+    user_hypotheses: list[str] | None = None,
+) -> str:
+    """
+    Get source-aware query generation prompt.
+
+    Selects the appropriate prompt template based on source type:
+    - knowledge_graph (INDRA): Extract gene/protein names
+    - academic (PubMed, arXiv, Scholar): Natural language queries
+    - pubmed: PubMed-specific (backwards compat)
+
+    Args:
+        research_goal: The research goal
+        source_type: Type of literature source (from ToolConfig.source_type)
+        preferences: Optional user preferences
+        attributes: Optional user attributes
+        user_literature: Optional user-provided literature
+        user_hypotheses: Optional user-provided hypotheses
+
+    Returns:
+        Formatted prompt string
+    """
+    # select template based on source type
+    if source_type == "knowledge_graph":
+        template_name = "literature_review_query_generation_indra"
+    elif source_type == "pubmed":
+        template_name = "literature_review_query_generation_pubmed"
+    else:
+        # generic fallback for other academic sources
+        template_name = "literature_review_query_generation_generic"
+
+    return load_prompt(
+        template_name,
         {
             "research_goal": research_goal,
             "preferences": preferences if preferences else "None provided",
@@ -784,6 +847,7 @@ def get_hypothesis_validation_synthesis_prompt(
     research_goal: str,
     hypotheses_with_analyses: list[Dict[str, Any]],
     articles: List[Any] | None = None,
+    tool_registry: Optional[Any] = None,
 ) -> str:
     """
     Get the prompt for validation synthesis based on novelty analyses.
@@ -829,14 +893,96 @@ def get_hypothesis_validation_synthesis_prompt(
 
         hypotheses_text.append(hyp_section)
 
-    return load_prompt(
-        "hypothesis_validation_synthesis",
-        {
-            "research_goal": research_goal,
-            "hypotheses_with_analyses": "\n\n".join(hypotheses_text),
-            "articles_metadata": format_articles_metadata(articles or []),
-        },
-    )
+    variables = {
+        "research_goal": research_goal,
+        "hypotheses_with_analyses": "\n\n".join(hypotheses_text),
+        "articles_metadata": format_articles_metadata(articles or []),
+    }
+
+    # inject domain-specific prompt customizations
+    variables.update(_get_domain_variables(tool_registry))
+
+    return load_prompt("hypothesis_validation_synthesis", variables)
+
+
+def get_validation_synthesis_prompt_with_tools(
+    research_goal: str,
+    hypotheses_with_analyses: list[Dict[str, Any]],
+    articles: List[Any] | None = None,
+    articles_with_reasoning: str | None = None,
+    max_iterations: int = 8,
+    tool_registry: Optional[Any] = None,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """
+    Get prompt for validation synthesis with tool access.
+
+    This version includes tool instructions so the LLM can search for
+    additional papers when deciding to pivot hypotheses.
+
+    Args:
+        research_goal: The research goal
+        hypotheses_with_analyses: List of draft hypotheses with novelty analyses
+        articles: Optional list of Article objects for citation metadata
+        articles_with_reasoning: Literature review synthesis
+        max_iterations: Max tool iterations for the agent
+        tool_registry: Optional ToolRegistry for dynamic tool instructions
+    """
+    # get tool IDs for validation workflow
+    tool_ids = []
+    if tool_registry:
+        tool_ids = tool_registry.get_tools_for_workflow("validation")
+
+    # build dynamic tool instructions
+    tool_instructions = build_tool_instructions(tool_ids, tool_registry)
+
+    # format hypotheses with their novelty analyses (same as non-tool version)
+    hypotheses_text = []
+    for i, hyp_data in enumerate(hypotheses_with_analyses, 1):
+        draft = hyp_data.get("draft", {})
+        analyses = hyp_data.get("novelty_analyses", [])
+
+        hyp_section = f"""### draft hypothesis {i}
+**text:** {draft.get('text', 'Unknown')}
+**gap reasoning:** {draft.get('gap_reasoning', 'N/A')}
+**literature sources:** {draft.get('literature_sources', 'N/A')}
+
+**novelty analyses ({len(analyses)} papers examined):**
+"""
+
+        for j, analysis_data in enumerate(analyses, 1):
+            paper_meta = analysis_data.get("paper_metadata", {})
+            analysis = analysis_data.get("analysis", {})
+
+            paper_analysis = f"""
+**paper {j}:** {paper_meta.get('title', 'Unknown')} ({paper_meta.get('year', 'N/A')})
+- methods used: {analysis.get('methods_used', 'N/A')}
+- populations studied: {analysis.get('populations_studied', 'N/A')}
+- mechanisms investigated: {analysis.get('mechanisms_investigated', 'N/A')}
+- key findings: {analysis.get('key_findings', 'N/A')}
+- stated limitations: {analysis.get('stated_limitations', 'N/A')}
+- future work suggested: {analysis.get('future_work_suggested', 'N/A')}
+- **novelty assessment: {analysis.get('novelty_assessment', 'N/A')}**
+- overlap explanation: {analysis.get('overlap_explanation', 'N/A')}
+"""
+            hyp_section += paper_analysis
+
+        hypotheses_text.append(hyp_section)
+
+    variables = {
+        "research_goal": research_goal,
+        "hypotheses_with_analyses": "\n\n".join(hypotheses_text),
+        "hypotheses_count": len(hypotheses_with_analyses),
+        "articles_metadata": format_articles_metadata(articles or []),
+        "articles_with_reasoning": articles_with_reasoning
+        or "no literature review summary available.",
+        "max_iterations": max_iterations,
+        "tool_instructions": tool_instructions,
+    }
+
+    # inject domain-specific prompt customizations
+    variables.update(_get_domain_variables(tool_registry))
+
+    return load_prompt_with_schema("hypothesis_validation_synthesis_with_tools", variables)
 
 
 def get_debate_generation_prompt(
@@ -849,6 +995,7 @@ def get_debate_generation_prompt(
     is_final_turn: bool = False,
     articles_with_reasoning: str | None = None,
     articles: List[Any] | None = None,
+    tool_registry: Optional[Any] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
     Get the debate-based hypothesis generation prompt.
@@ -919,6 +1066,9 @@ def get_debate_generation_prompt(
         variables["supervisor_guidance"] = "".join(guidance_sections) if has_content else ""
     else:
         variables["supervisor_guidance"] = ""
+
+    # inject domain-specific prompt customizations
+    variables.update(_get_domain_variables(tool_registry))
 
     # determine which prompt to use based on literature availability
     prompt_name = (
@@ -1126,6 +1276,61 @@ You can use tools to:
 """
 
 
+def build_tool_instructions(
+    tool_ids: List[str],
+    tool_registry: Optional[Any] = None,
+) -> str:
+    """
+    Build dynamic tool instructions section from tool registry.
+
+    Args:
+        tool_ids: List of tool IDs to include in instructions
+        tool_registry: ToolRegistry instance with tool configurations
+
+    Returns:
+        Formatted markdown section describing available tools
+    """
+    # if no registry provided, try to get the global one
+    if tool_registry is None:
+        try:
+            from .config import get_tool_registry
+
+            tool_registry = get_tool_registry()
+            # if no tool_ids provided, get them from draft workflow
+            if not tool_ids:
+                tool_ids = tool_registry.get_tools_for_workflow("draft_generation")
+        except Exception:
+            pass
+
+    if not tool_registry or not tool_ids:
+        # minimal fallback when no config available
+        return "No tool configuration available. Literature tools may not be accessible."
+
+    sections = []
+
+    for tool_id in tool_ids:
+        tool_config = tool_registry.get_tool(tool_id)
+        if not tool_config or not tool_config.enabled:
+            continue
+
+        # add tool entry
+        sections.append(f"- `{tool_config.mcp_tool_name}`: {tool_config.description}")
+
+        # add prompt snippet if available
+        if tool_config.prompt_snippet:
+            # indent the snippet
+            snippet_lines = tool_config.prompt_snippet.strip().split("\n")
+            for line in snippet_lines:
+                sections.append(f"  {line}")
+
+        sections.append("")  # blank line between tools
+
+    if not sections:
+        return "No tools available."
+
+    return "\n".join(sections).strip()
+
+
 def get_draft_prompt_with_tools(
     research_goal: str,
     hypotheses_count: int,
@@ -1137,14 +1342,36 @@ def get_draft_prompt_with_tools(
     user_hypotheses: List[str] | None = None,
     instructions: str | None = None,
     max_iterations: int = 8,
+    tool_registry: Optional[Any] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
-    get prompt for Phase 1: drafting hypotheses with tools
+    Get prompt for Phase 1: drafting hypotheses with tools.
 
-    uses generation_draft_with_tools.md template
-    focuses on reading papers and identifying gaps
-    includes lit review summary as context (not instructions)
+    Uses generation_draft_with_tools.md template.
+    Focuses on reading papers and identifying gaps.
+    Includes lit review summary as context (not instructions).
+
+    Args:
+        research_goal: The research goal
+        hypotheses_count: Number of hypotheses to draft
+        supervisor_guidance: Optional guidance from supervisor
+        articles: List of Article objects from literature review
+        articles_with_reasoning: Literature review synthesis
+        preferences: Criteria for strong hypotheses
+        attributes: Key attributes to prioritize
+        user_hypotheses: User-provided starting hypotheses
+        instructions: Custom instructions
+        max_iterations: Max tool iterations for the agent
+        tool_registry: Optional ToolRegistry for dynamic tool instructions
     """
+    # get tool IDs for draft generation workflow
+    tool_ids = []
+    if tool_registry:
+        tool_ids = tool_registry.get_tools_for_workflow("draft_generation")
+
+    # build dynamic tool instructions
+    tool_instructions = build_tool_instructions(tool_ids, tool_registry)
+
     variables = {
         "goal": research_goal,
         "hypotheses_count": hypotheses_count,
@@ -1158,6 +1385,10 @@ def get_draft_prompt_with_tools(
         "max_iterations": max_iterations,
         "instructions": instructions
         or "Focus on creative ideation - draft diverse hypotheses based on literature gaps.",
+        "tool_instructions": tool_instructions,
     }
+
+    # inject domain-specific prompt customizations
+    variables.update(_get_domain_variables(tool_registry))
 
     return load_prompt_with_schema("generation_draft_with_tools", variables)
