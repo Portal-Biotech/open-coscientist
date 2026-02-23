@@ -39,6 +39,7 @@ from ..prompts import (
 from ..schemas import LITERATURE_QUERY_SCHEMA, LITERATURE_PAPER_ANALYSIS_SCHEMA
 from ..state import WorkflowState
 
+from .reflection_helpers import extract_entity_names
 from .literature_review_helpers import (
     SearchConfig,
     ContentToolConfig,
@@ -563,6 +564,234 @@ async def _phase2_5_fetch_content(
 
 
 # =============================================================================
+# Phase 2.6: Context enrichment (knowledge-graph / external tools)
+# =============================================================================
+
+# max chars injected into synthesis prompt from all enrichment tools combined
+_CONTEXT_ENRICHMENT_MAX_CHARS = 1500
+# max results requested per entity per tool call
+_CONTEXT_ENRICHMENT_RESULTS_PER_ENTITY = 4
+
+
+async def _call_enrichment_tool_for_entity(
+    tool_name: str,
+    mapped_params: Dict[str, Any],
+    mcp_client: MCPToolClient,
+) -> Any:
+    """Call one enrichment tool for one entity; returns raw result or None."""
+    try:
+        return await mcp_client.call_tool(tool_name, **mapped_params)
+    except Exception as e:
+        logger.debug(f"context enrichment call failed ({tool_name}): {e}")
+        return None
+
+
+def _parse_enrichment_result(raw: Any) -> tuple[str, List[Dict[str, Any]]]:
+    """Extract formatted text AND structured items from an enrichment tool result.
+
+    Returns (display_text, structured_items) where structured_items is a list
+    of dicts suitable for storage in context_enrichment_sources.
+    """
+    import json as _json
+
+    data = raw
+    if isinstance(raw, str):
+        try:
+            data = _json.loads(raw)
+        except (ValueError, TypeError):
+            text = raw[:300] if raw else ""
+            return text, [{"display": text, "data": {}}] if text else []
+
+    if isinstance(data, dict):
+        # INDRA-shaped response: has a "statements" key (even when empty).
+        # Never fall through to the raw-dict repr for this format.
+        if "statements" in data:
+            stmts = data.get("statements", [])
+            if not stmts:
+                return "", []  # entity had no results - skip cleanly
+            lines = []
+            items = []
+            for s in stmts[:_CONTEXT_ENRICHMENT_RESULTS_PER_ENTITY]:
+                subj = (s.get("subj") or {}).get("name", "")
+                obj = (s.get("obj") or {}).get("name", "")
+                rel = s.get("type", "")
+                belief = s.get("belief", 0)
+                if subj and obj:
+                    display = f"{subj} \u2192 {obj} [{rel}] (belief: {belief:.2f})"
+                    lines.append(f"- {display}")
+                    items.append({"display": f"INDRA: {display}", "data": s})
+            return "\n".join(lines), items
+
+        results = data.get("results", [])
+        if results:
+            capped = results[:_CONTEXT_ENRICHMENT_RESULTS_PER_ENTITY]
+            text = "\n".join(str(r)[:120] for r in capped)
+            items = [{"display": str(r)[:120], "data": r if isinstance(r, dict) else {}} for r in capped]
+            return text, items
+
+        text = str(data)[:300]
+        return text, [{"display": text, "data": data}] if text else []
+
+    if isinstance(data, list):
+        capped = data[:_CONTEXT_ENRICHMENT_RESULTS_PER_ENTITY]
+        text = "\n".join(str(item)[:120] for item in capped)
+        items = [{"display": str(item)[:120], "data": item if isinstance(item, dict) else {}} for item in capped]
+        return text, items
+
+    text = str(data)[:300] if data else ""
+    return text, [{"display": text, "data": {}}] if text else []
+
+
+async def _call_enrichment_tool_for_entities(
+    tool_config: Any,
+    entities: List[str],
+    mcp_client: MCPToolClient,
+) -> tuple[str, List[Dict[str, Any]]]:
+    """Call one enrichment tool for all entities in parallel.
+
+    Returns (formatted_text, structured_items) where structured_items carry
+    the tool_id so they can be stored in context_enrichment_sources.
+    """
+    tool_name = tool_config.mcp_tool_name
+    tool_id = getattr(tool_config, "tool_id", tool_name)
+    canonical = {"entity_name": "", "limit": _CONTEXT_ENRICHMENT_RESULTS_PER_ENTITY}
+
+    async def _query_one(entity: str) -> tuple[str, List[Dict[str, Any]]]:
+        params = tool_config.map_parameters({**canonical, "entity_name": entity})
+        raw = await _call_enrichment_tool_for_entity(tool_name, params, mcp_client)
+        if raw is None:
+            return "", []
+        text, items = _parse_enrichment_result(raw)
+        # tag each item with entity and tool_id for citation building
+        for item in items:
+            item.setdefault("tool_id", tool_id)
+            item.setdefault("entity", entity)
+        return text, items
+
+    per_entity = await asyncio.gather(*[_query_one(e) for e in entities])
+
+    text_lines: List[str] = []
+    all_items: List[Dict[str, Any]] = []
+    for entity, (text, items) in zip(entities, per_entity):
+        if text:
+            text_lines.append(f"[{entity}]\n{text}")
+        all_items.extend(items)
+
+    return "\n\n".join(text_lines), all_items
+
+
+async def _phase2_6_fetch_context_enrichment(
+    state: WorkflowState,
+    config: SearchConfig,
+    mcp_client: MCPToolClient,
+) -> tuple[str, List[Dict[str, Any]]]:
+    """Phase 2.6: fetch background context from configured knowledge-graph tools.
+
+    Completely YAML-driven: only runs when the literature_review workflow
+    lists tools under 'context_enrichment_tools'. Returns ("", []) when not
+    configured, keeping lit review unchanged for other domains.
+
+    Calls all configured tools × all extracted entities in parallel.
+    Output text is capped to avoid bloating the synthesis prompt.
+
+    Returns:
+        (formatted_text_for_synthesis, structured_items_for_citation_index)
+    """
+    empty: tuple[str, List[Dict[str, Any]]] = ("", [])
+
+    workflow = config.workflow
+    if not workflow or not workflow.context_enrichment_tools:
+        return empty
+
+    tool_registry = config.tool_registry
+    if not tool_registry:
+        return empty
+
+    entities = extract_entity_names(state["research_goal"], max_entities=3)
+    if not entities:
+        logger.debug("context enrichment: no entities extracted from research goal")
+        return empty
+
+    logger.info(
+        f"Phase 2.6: fetching context enrichment for entities {entities} "
+        f"via {len(workflow.context_enrichment_tools)} tool(s)"
+    )
+
+    tool_configs = []
+    for tool_id in workflow.context_enrichment_tools:
+        tc = tool_registry.get_tool(tool_id)
+        if tc and tc.enabled and mcp_client.has_tool(tc.mcp_tool_name):
+            # stash the yaml tool_id for downstream citation building
+            tc._yaml_tool_id = tool_id
+            tool_configs.append(tc)
+        else:
+            logger.debug(f"context enrichment: tool '{tool_id}' unavailable or disabled")
+
+    if not tool_configs:
+        return empty
+
+    tool_tasks = [
+        _call_enrichment_tool_for_entities(tc, entities, mcp_client)
+        for tc in tool_configs
+    ]
+    tool_results = await asyncio.gather(*tool_tasks, return_exceptions=True)
+
+    sections: List[str] = []
+    all_structured: List[Dict[str, Any]] = []
+    for tc, result in zip(tool_configs, tool_results):
+        if isinstance(result, Exception):
+            logger.debug(f"context enrichment: {tc.mcp_tool_name} raised {result}")
+            continue
+        text, items = result
+        if text:
+            sections.append(f"**{tc.display_name}**\n{text}")
+        # tag items with the yaml tool_id
+        yaml_tool_id = getattr(tc, "_yaml_tool_id", tc.mcp_tool_name)
+        for item in items:
+            item["tool_id"] = yaml_tool_id
+        all_structured.extend(items)
+
+    if not sections and not all_structured:
+        return empty
+
+    combined = "\n\n".join(sections)
+    if len(combined) > _CONTEXT_ENRICHMENT_MAX_CHARS:
+        combined = combined[: _CONTEXT_ENRICHMENT_MAX_CHARS] + "\n[...truncated]"
+
+    logger.info(
+        f"Phase 2.6 complete: {len(sections)} tool(s), {len(all_structured)} structured items "
+        f"({len(combined)} chars)"
+    )
+    return combined, all_structured
+
+
+# =============================================================================
+# KG evidence section formatting (appended to synthesis after articles are built)
+# =============================================================================
+
+
+def _format_kg_section_with_keys(
+    context_enrichment_sources: List[Dict[str, Any]],
+    paper_count: int,
+) -> str:
+    """Format context enrichment sources as a labeled [C*] section.
+
+    Keys start at C{paper_count + 1}, exactly matching what build_reference_index
+    will assign at generation time (papers fill C1..Cn first, then these entries
+    follow). This lets the generation LLM see the same [C*] handles in
+    articles_with_reasoning that appear in its Citation Reference List.
+    """
+    if not context_enrichment_sources:
+        return ""
+    lines = []
+    for i, item in enumerate(context_enrichment_sources):
+        key = f"C{paper_count + i + 1}"
+        display = item.get("display", "External source")
+        lines.append(f"[{key}] {display}")
+    return "\n\n---\n\n## Knowledge Graph Evidence\n\n" + "\n\n".join(lines)
+
+
+# =============================================================================
 # Phase 3: Paper analysis
 # =============================================================================
 
@@ -652,6 +881,7 @@ async def _phase3_analyze_papers(
 async def _phase4_synthesize(
     paper_analyses: List[Dict[str, Any]],
     state: WorkflowState,
+    background_context: str = "",
 ) -> str:
     """Phase 4: Synthesize across papers to create articles_with_reasoning."""
     if not paper_analyses:
@@ -664,6 +894,7 @@ async def _phase4_synthesize(
         prompt = get_literature_review_synthesis_prompt(
             research_goal=state["research_goal"],
             paper_analyses=paper_analyses,
+            background_context=background_context,
         )
 
         save_prompt_to_disk(
@@ -762,8 +993,13 @@ async def literature_review_node(state: WorkflowState) -> Dict[str, Any]:
     # phase 2.4: discover PDF links
     await _phase2_4_discover_pdf_links(all_paper_metadata, paper_source_map, config, mcp_client)
 
-    # phase 2.5: fetch content
-    await _phase2_5_fetch_content(all_paper_metadata, paper_source_map, config, mcp_client, state)
+    # phase 2.5 + 2.6: fetch content and context enrichment in parallel
+    content_task = _phase2_5_fetch_content(
+        all_paper_metadata, paper_source_map, config, mcp_client, state
+    )
+    enrichment_task = _phase2_6_fetch_context_enrichment(state, config, mcp_client)
+    _, enrichment_result = await asyncio.gather(content_task, enrichment_task)
+    background_context, context_enrichment_sources = enrichment_result
 
     # check fulltext availability
     with_fulltext, without_fulltext = count_papers_with_fulltext(all_paper_metadata)
@@ -805,7 +1041,7 @@ async def literature_review_node(state: WorkflowState) -> Dict[str, Any]:
 
     # phase 4: synthesize
     if paper_analyses:
-        synthesis = await _phase4_synthesize(paper_analyses, state)
+        synthesis = await _phase4_synthesize(paper_analyses, state, background_context)
     else:
         synthesis = LITERATURE_REVIEW_FAILED
 
@@ -815,6 +1051,21 @@ async def literature_review_node(state: WorkflowState) -> Dict[str, Any]:
         all_paper_metadata, paper_source_map, config.source_name, config.tool_registry
     )
     logger.info(f"Created {len(articles)} article objects")
+
+    # append knowledge graph evidence with [C*] keys aligned to the reference index.
+    # keys start after the analyzed papers so they match what build_reference_index
+    # will assign at generation time — giving the generation LLM explicit handles to cite.
+    if context_enrichment_sources and synthesis != LITERATURE_REVIEW_FAILED:
+        used_paper_count = sum(
+            1 for a in articles if getattr(a, "used_in_analysis", False)
+        )
+        kg_section = _format_kg_section_with_keys(context_enrichment_sources, used_paper_count)
+        if kg_section:
+            synthesis = synthesis + kg_section
+            logger.info(
+                f"Appended {len(context_enrichment_sources)} KG source(s) with "
+                f"[C{used_paper_count + 1}...] keys to synthesis"
+            )
 
     # emit completion
     await emit_progress(
@@ -833,6 +1084,8 @@ async def literature_review_node(state: WorkflowState) -> Dict[str, Any]:
 
     # build and cache result
     result = make_success_result(synthesis, queries, articles)
+    if context_enrichment_sources:
+        result["context_enrichment_sources"] = context_enrichment_sources
     node_cache.set("literature_review", result, force=force_cache, **cache_params)
 
     return result
