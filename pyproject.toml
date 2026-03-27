@@ -34,6 +34,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+pdf = [
+    "pypdf>=4.0.0",
+]
 dev = [
     "pytest~=9.0.2",
     "pytest-asyncio~=1.3.0",
@@ -42,6 +45,10 @@ dev = [
     "mypy~=1.19.1",
     "python-dotenv~=1.2.1",
 ]
+
+[project.scripts]
+coscientist-run = "open_coscientist.cli:main"
+coscientist-report = "open_coscientist.report:main"
 
 [project.urls]
 Homepage = "https://github.com/jataware/open-coscientist"

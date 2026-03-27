@@ -16,7 +16,7 @@ Prerequisites:
 which depends on the MODEL_NAME you set below.
 """
 
-MODEL_NAME = "gemini/gemini-2.5-flash"
+MODEL_NAME = "anthropic/claude-sonnet-4-5"
 
 async def main():
     # Prompt user for research goal with rich formatting

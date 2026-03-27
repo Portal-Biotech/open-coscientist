@@ -38,7 +38,7 @@ class HypothesisGenerator:
 
     Example:
         >>> generator = HypothesisGenerator(
-        ...     model_name="gemini/gemini-2.5-flash",
+        ...     model_name="anthropic/claude-sonnet-4-5",
         ...     max_iterations=1,
         ...     initial_hypotheses_count=5,
         ...     evolution_max_count=3
@@ -51,7 +51,7 @@ class HypothesisGenerator:
 
     def __init__(
         self,
-        model_name: str = "gemini/gemini-2.5-flash",
+        model_name: str = "anthropic/claude-sonnet-4-5",
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         initial_hypotheses_count: int = DEFAULT_INITIAL_HYPOTHESES_COUNT,
         evolution_max_count: int = DEFAULT_EVOLUTION_MAX_COUNT,
@@ -249,6 +249,16 @@ class HypothesisGenerator:
         opts = opts or {}
         user_inputs = opts.get("user_inputs") or {}
 
+        # Load user-supplied PDF papers if provided
+        user_provided_articles = None
+        supplement_with_mcp = bool(user_inputs.get("supplement_with_mcp", False))
+        pdf_paths = user_inputs.get("pdf_paths") or []
+        if pdf_paths:
+            from .pdf_loader import PdfLoader
+            logger.info(f"Loading {len(pdf_paths)} user-supplied PDF(s)")
+            user_provided_articles = PdfLoader().load(pdf_paths)
+            logger.info(f"Loaded {len(user_provided_articles)} article(s) from user PDFs")
+
         # Determine if literature review node should be included
         # Check if explicitly set in opts first to avoid unnecessary MCP checks
         enable_literature_review_node_opt = opts.get("enable_literature_review_node")
@@ -286,6 +296,15 @@ class HypothesisGenerator:
                     "Literature review node requested but MCP server unavailable - disabling"
                 )
                 enable_literature_review_node = False
+
+        # If user supplied their own papers, keep the literature review node alive so it
+        # can synthesise from those papers — even when MCP is unavailable.
+        if user_provided_articles and not supplement_with_mcp and not enable_literature_review_node:
+            logger.info(
+                "User-supplied papers provided without MCP supplement: "
+                "enabling literature review node for local-paper synthesis"
+            )
+            enable_literature_review_node = True
 
         # Determine if generate node should use tool-calling generation
         # user can override via opts, default False
@@ -360,6 +379,9 @@ class HypothesisGenerator:
             "constraints": opts.get("constraints"),
             "starting_hypotheses": user_inputs.get("starting_hypotheses"),
             "literature": user_inputs.get("literature"),
+            # User-supplied papers (from PDF loader or raw dicts)
+            "user_provided_articles": user_provided_articles,
+            "supplement_with_mcp": supplement_with_mcp,
         }
 
         return initial_state, start_time, run_id
@@ -483,6 +505,7 @@ class HypothesisGenerator:
                 "evolution_details": final_state.get("evolution_details", []),
                 "debate_transcripts": final_state.get("debate_transcripts"),
                 "execution_time": execution_time,
+                "run_id": run_id,
                 "metrics": {
                     "total_time": execution_time,
                     "hypothesis_count": final_state["metrics"].hypothesis_count,
@@ -520,6 +543,7 @@ class HypothesisGenerator:
 
         # Delegate to streaming implementation
         async for node_name, state_dict in self._handle_streaming(initial_state, start_time):
+            state_dict["run_id"] = run_id
             yield node_name, state_dict
 
     async def _handle_streaming(
