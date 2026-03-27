@@ -15,7 +15,7 @@ Example usage:
     >>> from open_coscientist import HypothesisGenerator
     >>>
     >>> generator = HypothesisGenerator(
-    ...     model_name="gemini/gemini-2.5-flash",
+    ...     model_name="anthropic/claude-sonnet-4-5",
     ...     max_iterations=1,
     ...     initial_hypotheses_count=5,
     ...     evolution_max_count=3
@@ -44,6 +44,8 @@ from .state import WorkflowState, WorkflowConfig
 from .cache import clear_cache, get_cache_stats, clear_node_cache, get_node_cache_stats
 from .console import ConsoleReporter
 from .config import ToolRegistry, get_tool_registry
+from .report import HtmlReporter, CacheReportBuilder
+from .pdf_loader import PdfLoader
 
 __version__ = "0.1.0"
 __all__ = [
@@ -54,6 +56,9 @@ __all__ = [
     "WorkflowState",
     "WorkflowConfig",
     "ConsoleReporter",
+    "HtmlReporter",
+    "CacheReportBuilder",
+    "PdfLoader",
     "clear_cache",
     "get_cache_stats",
     "clear_node_cache",

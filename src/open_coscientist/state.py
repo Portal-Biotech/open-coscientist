@@ -226,6 +226,16 @@ class WorkflowState(TypedDict):
     (e.g., INDRA mechanistic statements). Used to build [KG1]-style citation keys
     for hypothesis generation. Domain-agnostic: any enrichment tool can populate this."""
 
+    # User-supplied papers
+    user_provided_articles: Optional[List[Any]]
+    """Optional: user-supplied Article objects (e.g. loaded from local PDFs via PdfLoader).
+    When set, the literature review node uses these instead of (or in addition to) MCP results."""
+
+    supplement_with_mcp: Optional[bool]
+    """When True and user_provided_articles is set, the pipeline ALSO runs an MCP search
+    and merges those results with the user-supplied papers before synthesis.
+    Defaults to False (use only the user-supplied papers)."""
+
 
 class WorkflowConfig(TypedDict):
     """Configuration for the hypothesis generation workflow."""

@@ -927,6 +927,72 @@ async def _phase4_synthesize(
 
 
 # =============================================================================
+# User-supplied paper helpers
+# =============================================================================
+
+
+def _user_articles_to_metadata(articles: list) -> Dict[str, Dict[str, Any]]:
+    """Convert a list of Article objects to the paper_metadata dict expected by phase 3.
+
+    The key difference from MCP-sourced metadata is that we store the full extracted
+    text in ``fulltext`` (which is what ``get_paper_content_for_analysis`` reads).
+    """
+    metadata: Dict[str, Dict[str, Any]] = {}
+    for i, article in enumerate(articles):
+        key = f"local_{i}"
+        metadata[key] = {
+            "title": getattr(article, "title", "") or "",
+            "authors": getattr(article, "authors", []) or [],
+            "year": getattr(article, "year", None),
+            "abstract": getattr(article, "abstract", "") or "",
+            # phase 3 reads 'fulltext'; Article stores it in 'content'
+            "fulltext": getattr(article, "content", "") or getattr(article, "abstract", "") or "",
+            "url": getattr(article, "url", None),
+            "source": getattr(article, "source", "local_pdf"),
+        }
+    return metadata
+
+
+async def _literature_review_from_user_papers(
+    state: WorkflowState,
+    user_articles: list,
+) -> Dict[str, Any]:
+    """Branch A: run phases 3+4 on user-supplied papers only (no MCP).
+
+    Skips query generation and paper collection entirely.  The user's Article
+    objects are converted to the same metadata dict format used by the MCP
+    path so that the existing per-paper analysis and synthesis functions can
+    be reused without modification.
+    """
+    logger.info(f"User-papers-only mode: processing {len(user_articles)} article(s)")
+    await emit_progress(state, "literature_review_start", "Analysing user-supplied papers...", 0.1)
+
+    # Mark all articles as used_in_analysis
+    for article in user_articles:
+        if hasattr(article, "used_in_analysis"):
+            article.used_in_analysis = True
+
+    paper_metadata = _user_articles_to_metadata(user_articles)
+    paper_analyses = await _phase3_analyze_papers(paper_metadata, state)
+
+    if paper_analyses:
+        synthesis = await _phase4_synthesize(paper_analyses, state)
+    else:
+        logger.error("No analyses produced from user-supplied papers")
+        synthesis = LITERATURE_REVIEW_FAILED
+
+    await emit_progress(
+        state,
+        "literature_review_complete",
+        "User-paper synthesis complete",
+        0.2,
+        articles_count=len(user_articles),
+    )
+
+    return make_success_result(synthesis, [], user_articles)
+
+
+# =============================================================================
 # Main node function
 # =============================================================================
 
@@ -942,8 +1008,24 @@ async def literature_review_node(state: WorkflowState) -> Dict[str, Any]:
     4. Fetch content (for sources without fulltext)
     5. Analyze each paper for gaps/limitations
     6. Synthesize findings into articles_with_reasoning
+
+    When ``state["user_provided_articles"]`` is set the node routes differently:
+
+    * ``supplement_with_mcp=False`` (Branch A): skips phases 1–2, runs phases
+      3–4 directly on the user-supplied papers.
+    * ``supplement_with_mcp=True`` (Branch B): runs phases 1–2 via MCP, then
+      merges the user papers into the collected set before phases 3–4.
     """
     logger.info("Starting literature review node")
+
+    # ------------------------------------------------------------------
+    # Branch A: user papers only — bypass MCP entirely
+    # ------------------------------------------------------------------
+    user_articles = state.get("user_provided_articles") or []
+    supplement = bool(state.get("supplement_with_mcp", False))
+
+    if user_articles and not supplement:
+        return await _literature_review_from_user_papers(state, user_articles)
 
     # setup configuration
     config = _get_search_config(state)
@@ -1035,6 +1117,23 @@ async def literature_review_node(state: WorkflowState) -> Dict[str, Any]:
     for paper_id, meta in list(all_paper_metadata.items())[:3]:
         has_ft = bool(meta.get("pmc_full_text_id") or meta.get("fulltext") or meta.get("pdf_url"))
         logger.debug(f"Paper {paper_id}: title='{meta.get('title', '')[:60]}...' has_fulltext={has_ft}")
+
+    # ------------------------------------------------------------------
+    # Branch B: merge user-supplied papers into MCP results before analysis
+    # ------------------------------------------------------------------
+    if user_articles and supplement:
+        user_meta = _user_articles_to_metadata(user_articles)
+        logger.info(
+            f"Supplement mode: merging {len(user_meta)} user paper(s) with "
+            f"{len(all_paper_metadata)} MCP paper(s)"
+        )
+        # User papers take precedence if keys clash (unlikely, but safe)
+        all_paper_metadata = {**all_paper_metadata, **user_meta}
+        # Ensure user articles are included in the final article list
+        # (build_articles_from_metadata only sees all_paper_metadata so we tag them)
+        for article in user_articles:
+            if hasattr(article, "used_in_analysis"):
+                article.used_in_analysis = True
 
     # phase 3: analyze papers
     paper_analyses = await _phase3_analyze_papers(all_paper_metadata, state)

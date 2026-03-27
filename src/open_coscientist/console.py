@@ -10,7 +10,7 @@ import logging
 import sys
 import time
 import warnings
-from typing import Any, AsyncIterator, Coroutine, Dict, Optional, Tuple
+from typing import Any, AsyncIterator, Coroutine, Dict, Optional, Tuple, Union
 
 from rich.console import Console
 from rich.panel import Panel
@@ -108,24 +108,38 @@ class ConsoleReporter:
     Handles streaming events from HypothesisGenerator and displays them
     with rich formatting (tables, panels, colors) in the terminal.
 
+    After the run completes an HTML report and a JSON results file are
+    automatically saved to *save_report_dir* (default: ``coscientist_reports/``).
+    Pass ``save_report=False`` to disable auto-saving.
+
     Example:
         >>> generator = HypothesisGenerator(...)
         >>> reporter = ConsoleReporter()
         >>> result = await reporter.run(
-        ...     generator.generate_hypotheses(research_goal="...", stream=True)
+        ...     generator.generate_hypotheses(research_goal="...", stream=True),
+        ...     research_goal="...",
         ... )
     """
 
-    def __init__(self, console: Optional[Console] = None, filter_stderr: bool = True):
+    def __init__(
+        self,
+        console: Optional[Console] = None,
+        filter_stderr: bool = True,
+        save_report: Union[bool, str] = True,
+    ):
         """
         Initialize console reporter.
 
         Args:
             console: Rich console instance (creates new one if None)
             filter_stderr: Whether to filter SSL/asyncio cleanup errors from stderr
+            save_report: ``True`` to save reports to ``coscientist_reports/``,
+                         a string path to use a custom directory, or ``False``
+                         to disable auto-saving.
         """
         self.console = console or Console()
         self.filter_stderr = filter_stderr
+        self.save_report = save_report
 
         # track what we've displayed to avoid duplicates
         self._displayed_research_plan = False
@@ -182,6 +196,31 @@ class ConsoleReporter:
             # show final summary
             execution_time = time.time() - start_time
             self._show_final_summary(last_state, execution_time)
+
+            # auto-save HTML report + JSON results
+            if self.save_report and last_state and last_state.get("hypotheses"):
+                try:
+                    from .report import HtmlReporter
+
+                    if last_state.get("execution_time") is None:
+                        last_state["execution_time"] = execution_time
+                    report_dir = (
+                        self.save_report
+                        if isinstance(self.save_report, str)
+                        else "coscientist_reports"
+                    )
+                    paths = HtmlReporter().save(
+                        last_state,
+                        output_dir=report_dir,
+                        research_goal=research_goal,
+                    )
+                    self.console.print()
+                    self.console.print(
+                        f"[dim green]Report saved → {paths['html']}[/dim green]"
+                    )
+                    self.console.file.flush()
+                except Exception as report_err:
+                    self.console.print(f"[dim red]Could not save report: {report_err}[/dim red]")
 
             # give time for connections to close gracefully
             await asyncio.sleep(0.5)
