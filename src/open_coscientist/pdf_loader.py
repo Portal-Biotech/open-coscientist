@@ -140,60 +140,97 @@ class PdfLoader:
         Extract text from each PDF and return a list of
         :class:`~open_coscientist.models.Article` objects.
 
+        All paths are validated for existence **before** any extraction begins
+        (fail-fast, all-or-nothing).  If any PDF cannot be read or yields no
+        extractable text the method raises immediately so the pipeline stops
+        rather than proceeding with incomplete literature context.
+
         Args:
             pdf_paths: Paths to PDF files (absolute or relative to CWD).
 
         Returns:
-            List of Article objects.  Each has:
+            List of Article objects with the same order as *pdf_paths*.  Each has:
 
-            * ``title`` – heuristically extracted (falls back to filename)
+            * ``title`` – heuristically extracted (falls back to filename stem)
             * ``abstract`` – heuristically extracted Abstract section
             * ``content`` – full extracted text (used for per-paper LLM analysis)
             * ``source`` – ``"local_pdf"``
             * ``used_in_analysis`` – ``True``
 
         Raises:
-            FileNotFoundError: If any path does not exist.
+            FileNotFoundError: If **any** path does not exist (checked upfront,
+                before extraction starts).
+            ValueError: If a PDF yields no extractable text (e.g. scanned /
+                image-only PDF).  The message names the offending file and
+                suggests OCR pre-processing.
+            RuntimeError: If pypdf raises an unexpected error while reading a
+                file (e.g. corrupted PDF).
             ImportError: If ``pypdf`` is not installed.
         """
         from .models import Article
 
+        if not pdf_paths:
+            return []
+
+        # ------------------------------------------------------------------
+        # Phase 1 — validate all paths exist BEFORE touching any file
+        # ------------------------------------------------------------------
+        missing = [p for p in pdf_paths if not Path(p).exists()]
+        if missing:
+            missing_list = "\n  ".join(missing)
+            raise FileNotFoundError(
+                f"The following PDF file(s) could not be found:\n  {missing_list}\n"
+                "Fix the path(s) and try again.  The pipeline has not started."
+            )
+
+        # ------------------------------------------------------------------
+        # Phase 2 — extract text from every PDF; stop on the first failure
+        # ------------------------------------------------------------------
         articles: List[Article] = []
 
         for path in pdf_paths:
             p = Path(path)
-            if not p.exists():
-                raise FileNotFoundError(
-                    f"PDF file not found: {path!r}\n"
-                    "Check the path and try again."
-                )
+            logger.info("Loading PDF: %s", path)
 
-            logger.info(f"Loading PDF: {path}")
             try:
                 text = _extract_text_from_pdf(str(p))
-                title = _guess_title(text, str(p))
-                abstract = _guess_abstract(text)
-
-                article = Article(
-                    title=title,
-                    url=p.resolve().as_uri(),
-                    authors=[],
-                    year=None,
-                    venue=None,
-                    citations=0,
-                    abstract=abstract,
-                    content=text,
-                    source_id=str(p),
-                    source="local_pdf",
-                    pdf_links=[str(p)],
-                    used_in_analysis=True,
-                )
-                articles.append(article)
-                logger.info(f"Loaded '{title[:60]}': {len(text):,} chars extracted")
-
             except Exception as exc:
-                logger.error(f"Failed to load PDF {path!r}: {exc}")
-                raise
+                logger.error("Failed to read PDF %r: %s", path, exc)
+                raise RuntimeError(
+                    f"Could not read PDF file {path!r}.\n"
+                    f"pypdf reported: {exc}\n"
+                    "The file may be corrupted or password-protected.  "
+                    "The pipeline has been stopped."
+                ) from exc
 
-        logger.info(f"PdfLoader: loaded {len(articles)} article(s) from PDFs")
+            if not text.strip():
+                raise ValueError(
+                    f"No text could be extracted from {path!r}.\n"
+                    "The PDF may be image-based (scanned).  "
+                    "Convert it to a text-based PDF with an OCR tool "
+                    "(e.g. `ocrmypdf input.pdf output.pdf`) and try again.\n"
+                    "The pipeline has been stopped."
+                )
+
+            title = _guess_title(text, str(p))
+            abstract = _guess_abstract(text)
+
+            article = Article(
+                title=title,
+                url=p.resolve().as_uri(),
+                authors=[],
+                year=None,
+                venue=None,
+                citations=0,
+                abstract=abstract,
+                content=text,
+                source_id=str(p),
+                source="local_pdf",
+                pdf_links=[str(p)],
+                used_in_analysis=True,
+            )
+            articles.append(article)
+            logger.info("Loaded %r: %s chars extracted", title[:60], f"{len(text):,}")
+
+        logger.info("PdfLoader: loaded %d article(s) from PDFs", len(articles))
         return articles
